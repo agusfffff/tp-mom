@@ -42,7 +42,129 @@ func CreateQueueMiddleware(queueName string, connectionSettings m.ConnSettings) 
 		return nil, ErrCreateMiddlewareDeclare
 	}
 
-	return &queueMiddleware{conn: conn, channel: ch, queue: q.Name}, nil
+	return &queueMiddleware{conn: conn, channel: ch, queue: q.Name, consuming: false, id: ""}, nil
+}
+
+type queueMiddleware struct {
+	conn      *amqp.Connection
+	channel   *amqp.Channel
+	queue     string
+	consuming bool
+	id        string
+}
+
+// Close implements [middleware.Middleware].
+func (q *queueMiddleware) Close() error {
+	if err := q.channel.Close(); err != nil {
+		return m.ErrMessageMiddlewareClose
+	}
+
+	return nil
+}
+
+// StartConsuming implements [middleware.Middleware].
+func (q *queueMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack func(), nack func())) error {
+	if q.consuming {
+		return nil
+	}
+
+	consumerTag := "consumer-queue-" + q.queue
+
+	msgCh, err := q.channel.Consume(
+		q.queue,     // queue
+		consumerTag, // consumer
+		false,       // auto-ack
+		false,       // exclusive
+		false,       // no-local
+		false,       // no-wait
+		nil,         // args
+	)
+
+	if err != nil {
+		if errors.Is(err, amqp.ErrClosed) {
+			return m.ErrMessageMiddlewareDisconnected
+		}
+		return m.ErrMessageMiddlewareMessage
+	}
+
+	q.id = consumerTag
+	q.consuming = true
+	go func() {
+		for msgD := range msgCh {
+			msg := m.Message{Body: string(msgD.Body)}
+
+			ack := func() {
+				_ = msgD.Ack(false)
+			}
+
+			nack := func() {
+				_ = msgD.Nack(false, true)
+			}
+
+			callbackFunc(msg, ack, nack)
+		}
+	}()
+
+	q.consuming = false
+
+	return nil
+
+}
+
+// StopConsuming implements [middleware.Middleware].
+func (q *queueMiddleware) StopConsuming() error {
+	if q.id == "" {
+		return nil
+	}
+
+	if q.channel == nil || q.channel.IsClosed() {
+		return m.ErrMessageMiddlewareDisconnected
+	}
+
+	if err := q.channel.Cancel(q.id, false); err != nil {
+		if errors.Is(err, amqp.ErrClosed) {
+			return m.ErrMessageMiddlewareDisconnected
+		}
+		return m.ErrMessageMiddlewareMessage
+	}
+
+	q.id = ""
+
+	return nil
+}
+
+func (q *queueMiddleware) Send(msg m.Message) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+
+	defer cancel()
+
+	err := q.channel.PublishWithContext(ctx,
+		"",      // exchange
+		q.queue, // routing key
+		false,   // mandatory
+		false,
+		amqp.Publishing{
+			DeliveryMode: amqp.Persistent,
+			ContentType:  "text/plain",
+			Body:         []byte(msg.Body),
+		})
+
+	if err == nil {
+		return nil
+	}
+
+	if errors.Is(err, amqp.ErrClosed) {
+		return m.ErrMessageMiddlewareDisconnected
+	}
+
+	return m.ErrMessageMiddlewareMessage
+}
+
+type exchangeMiddleware struct {
+	conn     *amqp.Connection
+	channel  *amqp.Channel
+	exchange string
+	keys     []string
 }
 
 func CreateExchangeMiddleware(exchange string, keys []string, connectionSettings m.ConnSettings) (m.Middleware, error) {
@@ -71,13 +193,6 @@ func CreateExchangeMiddleware(exchange string, keys []string, connectionSettings
 	}
 
 	return &exchangeMiddleware{conn: conn, channel: ch, exchange: exchange, keys: keys}, nil
-}
-
-type exchangeMiddleware struct {
-	conn     *amqp.Connection
-	channel  *amqp.Channel
-	exchange string
-	keys     []string
 }
 
 // Close implements [middleware.Middleware].
@@ -121,51 +236,4 @@ func (e *exchangeMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack
 // StopConsuming implements [middleware.Middleware].
 func (e *exchangeMiddleware) StopConsuming() error {
 	panic("unimplemented")
-}
-
-type queueMiddleware struct {
-	conn    *amqp.Connection
-	channel *amqp.Channel
-	queue   string
-}
-
-// Close implements [middleware.Middleware].
-func (q *queueMiddleware) Close() error {
-	panic("unimplemented")
-}
-
-// StartConsuming implements [middleware.Middleware].
-func (q *queueMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack func(), nack func())) error {
-	panic("unimplemented")
-}
-
-// StopConsuming implements [middleware.Middleware].
-func (q *queueMiddleware) StopConsuming() error {
-	panic("unimplemented")
-}
-
-func (q *queueMiddleware) Send(msg m.Message) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	err := q.channel.PublishWithContext(ctx,
-		"",      // exchange
-		q.queue, // routing key
-		false,   // mandatory
-		false,
-		amqp.Publishing{
-			DeliveryMode: amqp.Persistent,
-			ContentType:  "text/plain",
-			Body:         []byte(msg.Body),
-		})
-
-	if err == nil {
-		return nil
-	}
-
-	if errors.Is(err, amqp.ErrClosed) {
-		return m.ErrMessageMiddlewareDisconnected
-	}
-
-	return m.ErrMessageMiddlewareMessage
 }

@@ -89,6 +89,7 @@ func (q *queueMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack fu
 
 	q.id = consumerTag
 	q.consuming = true
+
 	go func() {
 		for msgD := range msgCh {
 			msg := m.Message{Body: string(msgD.Body)}
@@ -104,8 +105,6 @@ func (q *queueMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack fu
 			callbackFunc(msg, ack, nack)
 		}
 	}()
-
-	q.consuming = false
 
 	return nil
 
@@ -161,10 +160,13 @@ func (q *queueMiddleware) Send(msg m.Message) error {
 }
 
 type exchangeMiddleware struct {
-	conn     *amqp.Connection
-	channel  *amqp.Channel
-	exchange string
-	keys     []string
+	conn      *amqp.Connection
+	channel   *amqp.Channel
+	exchange  string
+	keys      []string
+	consuming bool
+	id        string
+	queue     string
 }
 
 func CreateExchangeMiddleware(exchange string, keys []string, connectionSettings m.ConnSettings) (m.Middleware, error) {
@@ -192,12 +194,17 @@ func CreateExchangeMiddleware(exchange string, keys []string, connectionSettings
 		return nil, ErrCreateMiddlewareDeclare
 	}
 
-	return &exchangeMiddleware{conn: conn, channel: ch, exchange: exchange, keys: keys}, nil
+	return &exchangeMiddleware{conn: conn, channel: ch, exchange: exchange, keys: keys, consuming: false, id: ""}, nil
 }
 
 // Close implements [middleware.Middleware].
 func (e *exchangeMiddleware) Close() error {
-	panic("unimplemented")
+	if err := e.channel.Close(); err != nil {
+		return m.ErrMessageMiddlewareClose
+	}
+
+	return nil
+
 }
 
 // Send implements [middleware.Middleware].
@@ -230,10 +237,105 @@ func (e *exchangeMiddleware) Send(msg m.Message) error {
 
 // StartConsuming implements [middleware.Middleware].
 func (e *exchangeMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack func(), nack func())) error {
-	panic("unimplemented")
+
+	if e.consuming {
+		return nil
+	}
+
+	q, err := e.channel.QueueDeclare(
+		"",    // name
+		false, // durability
+		false, // delete when unused
+		true,  // exclusive
+		false, // no-wait
+		nil,   // arguments
+	)
+
+	queue := q.Name
+	if err != nil {
+		if errors.Is(err, amqp.ErrClosed) {
+			return m.ErrMessageMiddlewareDisconnected
+		}
+		return m.ErrMessageMiddlewareMessage
+	}
+
+	for _, key := range e.keys {
+		err = e.channel.QueueBind(
+			queue,      // queue name
+			key,        // routing key
+			e.exchange, // exchange
+			false,
+			nil)
+
+		if err != nil {
+			if errors.Is(err, amqp.ErrClosed) {
+				return m.ErrMessageMiddlewareDisconnected
+			}
+			return m.ErrMessageMiddlewareMessage
+		}
+	}
+
+	consumerTag := "consumer-exchange-" + queue
+
+	msgCh, err := e.channel.Consume(
+		queue,       // queue
+		consumerTag, // consumer
+		false,       // auto-ack
+		false,       // exclusive
+		false,       // no-local
+		false,       // no-wait
+		nil,         // args
+	)
+
+	if err != nil {
+		if errors.Is(err, amqp.ErrClosed) {
+			return m.ErrMessageMiddlewareDisconnected
+		}
+		return m.ErrMessageMiddlewareMessage
+	}
+
+	e.id = consumerTag
+	e.queue = queue
+
+	go func() {
+		for msgD := range msgCh {
+			msg := m.Message{Body: string(msgD.Body)}
+
+			ack := func() {
+				_ = msgD.Ack(false)
+			}
+
+			nack := func() {
+				_ = msgD.Nack(false, true)
+			}
+
+			callbackFunc(msg, ack, nack)
+		}
+	}()
+
+	return nil
+
 }
 
 // StopConsuming implements [middleware.Middleware].
 func (e *exchangeMiddleware) StopConsuming() error {
-	panic("unimplemented")
+	if e.id == "" {
+		return nil
+	}
+
+	if e.channel == nil || e.channel.IsClosed() {
+		return m.ErrMessageMiddlewareDisconnected
+	}
+
+	if err := e.channel.Cancel(e.id, false); err != nil {
+		if errors.Is(err, amqp.ErrClosed) {
+			return m.ErrMessageMiddlewareDisconnected
+		}
+		return m.ErrMessageMiddlewareMessage
+	}
+
+	e.id = ""
+
+	return nil
+
 }

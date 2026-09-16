@@ -34,9 +34,7 @@ func CreateQueueMiddleware(queueName string, connectionSettings m.ConnSettings) 
 		false,     // delete when unused
 		false,     // exclusive
 		false,     // no-wait
-		amqp.Table{
-			amqp.QueueTypeArg: amqp.QueueTypeQuorum,
-		},
+		nil,
 	)
 	if err != nil {
 		return nil, ErrCreateMiddlewareDeclare
@@ -59,6 +57,9 @@ func (q *queueMiddleware) Close() error {
 		return m.ErrMessageMiddlewareClose
 	}
 
+	if err := q.conn.Close(); err != nil {
+		return m.ErrMessageMiddlewareClose
+	}
 	return nil
 }
 
@@ -66,6 +67,19 @@ func (q *queueMiddleware) Close() error {
 func (q *queueMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack func(), nack func())) error {
 	if q.consuming {
 		return nil
+	}
+
+	err := q.channel.Qos(
+		1,     // prefetch count
+		0,     // prefetch size
+		false, // global
+	)
+
+	if err != nil {
+		if errors.Is(err, amqp.ErrClosed) {
+			return m.ErrMessageMiddlewareDisconnected
+		}
+		return m.ErrMessageMiddlewareMessage
 	}
 
 	consumerTag := "consumer-queue-" + q.queue
@@ -128,6 +142,7 @@ func (q *queueMiddleware) StopConsuming() error {
 	}
 
 	q.id = ""
+	q.consuming = false
 
 	return nil
 }
@@ -203,6 +218,10 @@ func (e *exchangeMiddleware) Close() error {
 		return m.ErrMessageMiddlewareClose
 	}
 
+	if err := e.conn.Close(); err != nil {
+		return m.ErrMessageMiddlewareClose
+	}
+
 	return nil
 
 }
@@ -240,6 +259,19 @@ func (e *exchangeMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack
 
 	if e.consuming {
 		return nil
+	}
+
+	err := e.channel.Qos(
+		10,    // prefetch count
+		0,     // prefetch size
+		false, // global
+	)
+
+	if err != nil {
+		if errors.Is(err, amqp.ErrClosed) {
+			return m.ErrMessageMiddlewareDisconnected
+		}
+		return m.ErrMessageMiddlewareMessage
 	}
 
 	q, err := e.channel.QueueDeclare(
@@ -296,6 +328,7 @@ func (e *exchangeMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack
 
 	e.id = consumerTag
 	e.queue = queue
+	e.consuming = true
 
 	go func() {
 		for msgD := range msgCh {
@@ -319,7 +352,7 @@ func (e *exchangeMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack
 
 // StopConsuming implements [middleware.Middleware].
 func (e *exchangeMiddleware) StopConsuming() error {
-	if e.id == "" {
+	if e.id == "" || !e.consuming {
 		return nil
 	}
 
@@ -335,6 +368,7 @@ func (e *exchangeMiddleware) StopConsuming() error {
 	}
 
 	e.id = ""
+	e.consuming = false
 
 	return nil
 

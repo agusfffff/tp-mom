@@ -25,6 +25,7 @@ func CreateQueueMiddleware(queueName string, connectionSettings m.ConnSettings) 
 
 	ch, err := conn.Channel()
 	if err != nil {
+		_ = conn.Close()
 		return nil, ErrCreateMiddlewareChannel
 	}
 
@@ -37,6 +38,8 @@ func CreateQueueMiddleware(queueName string, connectionSettings m.ConnSettings) 
 		nil,
 	)
 	if err != nil {
+		_ = ch.Close()
+		_ = conn.Close()
 		return nil, ErrCreateMiddlewareDeclare
 	}
 
@@ -49,6 +52,7 @@ type queueMiddleware struct {
 	queue     string
 	consuming bool
 	id        string
+	signal    chan struct{}
 }
 
 // Close implements [middleware.Middleware].
@@ -103,8 +107,11 @@ func (q *queueMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack fu
 
 	q.id = consumerTag
 	q.consuming = true
+	signal := make(chan struct{})
+	q.signal = signal
 
 	go func() {
+		defer close(signal)
 		for msgD := range msgCh {
 			msg := m.Message{Body: string(msgD.Body)}
 
@@ -138,9 +145,11 @@ func (q *queueMiddleware) StopConsuming() error {
 		if errors.Is(err, amqp.ErrClosed) {
 			return m.ErrMessageMiddlewareDisconnected
 		}
-		return m.ErrMessageMiddlewareMessage
+		return m.ErrMessageMiddlewareClose
 	}
 
+	<-q.signal
+	q.signal = nil
 	q.id = ""
 	q.consuming = false
 
@@ -182,6 +191,7 @@ type exchangeMiddleware struct {
 	consuming bool
 	id        string
 	queue     string
+	signal    chan struct{}
 }
 
 func CreateExchangeMiddleware(exchange string, keys []string, connectionSettings m.ConnSettings) (m.Middleware, error) {
@@ -193,6 +203,7 @@ func CreateExchangeMiddleware(exchange string, keys []string, connectionSettings
 
 	ch, err := conn.Channel()
 	if err != nil {
+		_ = conn.Close()
 		return nil, ErrCreateMiddlewareChannel
 	}
 
@@ -206,6 +217,8 @@ func CreateExchangeMiddleware(exchange string, keys []string, connectionSettings
 		nil,      // arguments
 	)
 	if err != nil {
+		_ = ch.Close()
+		_ = conn.Close()
 		return nil, ErrCreateMiddlewareDeclare
 	}
 
@@ -329,8 +342,11 @@ func (e *exchangeMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack
 	e.id = consumerTag
 	e.queue = queue
 	e.consuming = true
+	signal := make(chan struct{})
+	e.signal = signal
 
 	go func() {
+		defer close(signal)
 		for msgD := range msgCh {
 			msg := m.Message{Body: string(msgD.Body)}
 
@@ -364,9 +380,11 @@ func (e *exchangeMiddleware) StopConsuming() error {
 		if errors.Is(err, amqp.ErrClosed) {
 			return m.ErrMessageMiddlewareDisconnected
 		}
-		return m.ErrMessageMiddlewareMessage
+		return m.ErrMessageMiddlewareClose
 	}
 
+	<-e.signal
+	e.signal = nil
 	e.id = ""
 	e.consuming = false
 

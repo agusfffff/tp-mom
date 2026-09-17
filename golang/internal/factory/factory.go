@@ -91,9 +91,13 @@ func (q *queueMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack fu
 
 	q.id = consumerTag
 	q.consuming = true
-	signal := make(chan struct{})
-	q.signal = signal
+	q.signal = consumeFrom(msgCh, callbackFunc)
+	return nil
 
+}
+
+func consumeFrom(msgCh <-chan amqp.Delivery, callbackFunc func(msg m.Message, ack func(), nack func())) chan struct{} {
+	signal := make(chan struct{})
 	go func() {
 		defer close(signal)
 		for msgD := range msgCh {
@@ -110,9 +114,7 @@ func (q *queueMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack fu
 			callbackFunc(msg, ack, nack)
 		}
 	}()
-
-	return nil
-
+	return signal
 }
 
 // StopConsuming implements [middleware.Middleware].
@@ -255,26 +257,15 @@ func (e *exchangeMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack
 		nil,
 	)
 
-	queue := q.Name
 	if err != nil {
 		return classifyError(err)
 	}
 
-	for _, key := range e.keys {
-		err = e.channel.QueueBind(
-			queue,
-			key,
-			e.exchange,
-			false,
-			nil)
+	queue := q.Name
 
-		if err != nil {
-			_, _ = e.channel.QueueDelete(queue, false, false, false)
-			if errors.Is(err, amqp.ErrClosed) {
-				return m.ErrMessageMiddlewareDisconnected
-			}
-			return m.ErrMessageMiddlewareMessage
-		}
+	err = bindKeys(e.channel, queue, e.exchange, e.keys)
+	if err != nil {
+		return err
 	}
 
 	consumerTag := consumerName + queue
@@ -297,28 +288,29 @@ func (e *exchangeMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack
 	e.id = consumerTag
 	e.queue = queue
 	e.consuming = true
-	signal := make(chan struct{})
-	e.signal = signal
-
-	go func() {
-		defer close(signal)
-		for msgD := range msgCh {
-			msg := m.Message{Body: string(msgD.Body)}
-
-			ack := func() {
-				_ = msgD.Ack(false)
-			}
-
-			nack := func() {
-				_ = msgD.Nack(false, true)
-			}
-
-			callbackFunc(msg, ack, nack)
-		}
-	}()
-
+	e.signal = consumeFrom(msgCh, callbackFunc)
 	return nil
 
+}
+
+func bindKeys(channel *amqp.Channel, queue string, exchange string, keys []string) error {
+	for _, key := range keys {
+		err := channel.QueueBind(
+			queue,
+			key,
+			exchange,
+			false,
+			nil)
+
+		if err != nil {
+			_, _ = channel.QueueDelete(queue, false, false, false)
+			if errors.Is(err, amqp.ErrClosed) {
+				return m.ErrMessageMiddlewareDisconnected
+			}
+			return m.ErrMessageMiddlewareMessage
+		}
+	}
+	return nil
 }
 
 // StopConsuming implements [middleware.Middleware].

@@ -17,18 +17,13 @@ var (
 )
 
 const publishTimeout = 5 * time.Second
+const consumerName = "consumer-"
 
 func CreateQueueMiddleware(queueName string, connectionSettings m.ConnSettings) (m.Middleware, error) {
-	url := fmt.Sprintf("amqp://%s:%d/", connectionSettings.Hostname, connectionSettings.Port)
-	conn, err := amqp.Dial(url)
-	if err != nil {
-		return nil, ErrCreateMiddlewareConn
-	}
+	conn, ch, err := dialAndConnectCh(connectionSettings.Hostname, connectionSettings.Port)
 
-	ch, err := conn.Channel()
 	if err != nil {
-		_ = conn.Close()
-		return nil, ErrCreateMiddlewareChannel
+		return nil, err
 	}
 
 	q, err := ch.QueueDeclare(
@@ -59,14 +54,7 @@ type queueMiddleware struct {
 
 // Close implements [middleware.Middleware].
 func (q *queueMiddleware) Close() error {
-	chErr := q.channel.Close()
-	conErr := q.conn.Close()
-
-	if chErr != nil || conErr != nil {
-		return m.ErrMessageMiddlewareClose
-	}
-
-	return nil
+	return closeChAndConn(q.channel, q.conn)
 }
 
 // StartConsuming implements [middleware.Middleware].
@@ -82,13 +70,10 @@ func (q *queueMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack fu
 	)
 
 	if err != nil {
-		if errors.Is(err, amqp.ErrClosed) {
-			return m.ErrMessageMiddlewareDisconnected
-		}
-		return m.ErrMessageMiddlewareMessage
+		return classifyError(err)
 	}
 
-	consumerTag := "consumer-queue-" + q.queue
+	consumerTag := consumerName + q.queue
 
 	msgCh, err := q.channel.Consume(
 		q.queue,
@@ -101,10 +86,7 @@ func (q *queueMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack fu
 	)
 
 	if err != nil {
-		if errors.Is(err, amqp.ErrClosed) {
-			return m.ErrMessageMiddlewareDisconnected
-		}
-		return m.ErrMessageMiddlewareMessage
+		return classifyError(err)
 	}
 
 	q.id = consumerTag
@@ -174,15 +156,12 @@ func (q *queueMiddleware) Send(msg m.Message) error {
 			Body:         []byte(msg.Body),
 		})
 
-	if err == nil {
-		return nil
+	if err != nil {
+		return classifyError(err)
 	}
 
-	if errors.Is(err, amqp.ErrClosed) {
-		return m.ErrMessageMiddlewareDisconnected
-	}
+	return nil
 
-	return m.ErrMessageMiddlewareMessage
 }
 
 type exchangeMiddleware struct {
@@ -197,16 +176,10 @@ type exchangeMiddleware struct {
 }
 
 func CreateExchangeMiddleware(exchange string, keys []string, connectionSettings m.ConnSettings) (m.Middleware, error) {
-	url := fmt.Sprintf("amqp://%s:%d/", connectionSettings.Hostname, connectionSettings.Port)
-	conn, err := amqp.Dial(url)
-	if err != nil {
-		return nil, ErrCreateMiddlewareConn
-	}
+	conn, ch, err := dialAndConnectCh(connectionSettings.Hostname, connectionSettings.Port)
 
-	ch, err := conn.Channel()
 	if err != nil {
-		_ = conn.Close()
-		return nil, ErrCreateMiddlewareChannel
+		return nil, err
 	}
 
 	err = ch.ExchangeDeclare(
@@ -229,14 +202,7 @@ func CreateExchangeMiddleware(exchange string, keys []string, connectionSettings
 
 // Close implements [middleware.Middleware].
 func (e *exchangeMiddleware) Close() error {
-	chErr := e.channel.Close()
-	conErr := e.conn.Close()
-
-	if chErr != nil || conErr != nil {
-		return m.ErrMessageMiddlewareClose
-	}
-
-	return nil
+	return closeChAndConn(e.channel, e.conn)
 }
 
 // Send implements [middleware.Middleware].
@@ -255,12 +221,8 @@ func (e *exchangeMiddleware) Send(msg m.Message) error {
 				Body:        []byte(msg.Body),
 			})
 
-		if errors.Is(err, amqp.ErrClosed) {
-			return m.ErrMessageMiddlewareDisconnected
-		}
-
 		if err != nil {
-			return m.ErrMessageMiddlewareMessage
+			return classifyError(err)
 		}
 	}
 
@@ -281,10 +243,7 @@ func (e *exchangeMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack
 	)
 
 	if err != nil {
-		if errors.Is(err, amqp.ErrClosed) {
-			return m.ErrMessageMiddlewareDisconnected
-		}
-		return m.ErrMessageMiddlewareMessage
+		return classifyError(err)
 	}
 
 	q, err := e.channel.QueueDeclare(
@@ -298,10 +257,7 @@ func (e *exchangeMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack
 
 	queue := q.Name
 	if err != nil {
-		if errors.Is(err, amqp.ErrClosed) {
-			return m.ErrMessageMiddlewareDisconnected
-		}
-		return m.ErrMessageMiddlewareMessage
+		return classifyError(err)
 	}
 
 	for _, key := range e.keys {
@@ -321,7 +277,7 @@ func (e *exchangeMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack
 		}
 	}
 
-	consumerTag := "consumer-exchange-" + queue
+	consumerTag := consumerName + queue
 
 	msgCh, err := e.channel.Consume(
 		queue,
@@ -335,10 +291,7 @@ func (e *exchangeMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack
 
 	if err != nil {
 		_, _ = e.channel.QueueDelete(queue, false, false, false)
-		if errors.Is(err, amqp.ErrClosed) {
-			return m.ErrMessageMiddlewareDisconnected
-		}
-		return m.ErrMessageMiddlewareMessage
+		return classifyError(err)
 	}
 
 	e.id = consumerTag
@@ -392,4 +345,39 @@ func (e *exchangeMiddleware) StopConsuming() error {
 
 	return nil
 
+}
+
+func closeChAndConn(channel *amqp.Channel, conn *amqp.Connection) error {
+	chErr := channel.Close()
+	conErr := conn.Close()
+
+	if chErr != nil || conErr != nil {
+		return m.ErrMessageMiddlewareClose
+	}
+
+	return nil
+}
+
+func classifyError(err error) error {
+	if errors.Is(err, amqp.ErrClosed) {
+		return m.ErrMessageMiddlewareDisconnected
+	}
+	return m.ErrMessageMiddlewareMessage
+}
+
+func dialAndConnectCh(hostname string, port int) (*amqp.Connection, *amqp.Channel, error) {
+	url := fmt.Sprintf("amqp://%s:%d/", hostname, port)
+	conn, err := amqp.Dial(url)
+
+	if err != nil {
+		return nil, nil, ErrCreateMiddlewareConn
+	}
+
+	ch, err := conn.Channel()
+	if err != nil {
+		_ = conn.Close()
+		return nil, nil, ErrCreateMiddlewareChannel
+	}
+
+	return conn, ch, nil
 }

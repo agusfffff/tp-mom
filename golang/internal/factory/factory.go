@@ -18,6 +18,7 @@ var (
 
 const publishTimeout = 5 * time.Second
 const consumerName = "consumer-"
+const prefetchMsg = 10
 
 func CreateQueueMiddleware(queueName string, connectionSettings m.ConnSettings) (m.Middleware, error) {
 	conn, ch, err := dialAndConnectCh(connectionSettings.Hostname, connectionSettings.Port)
@@ -239,7 +240,7 @@ func (e *exchangeMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack
 	}
 
 	err := e.channel.Qos(
-		10,
+		prefetchMsg,
 		0,
 		false,
 	)

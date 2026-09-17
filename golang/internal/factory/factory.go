@@ -16,6 +16,8 @@ var (
 	ErrCreateMiddlewareDeclare = errors.New("create middleware: declare failed")
 )
 
+const publishTimeout = 5 * time.Second
+
 func CreateQueueMiddleware(queueName string, connectionSettings m.ConnSettings) (m.Middleware, error) {
 	url := fmt.Sprintf("amqp://%s:%d/", connectionSettings.Hostname, connectionSettings.Port)
 	conn, err := amqp.Dial(url)
@@ -30,11 +32,11 @@ func CreateQueueMiddleware(queueName string, connectionSettings m.ConnSettings) 
 	}
 
 	q, err := ch.QueueDeclare(
-		queueName, // name
-		true,      // durability
-		false,     // delete when unused
-		false,     // exclusive
-		false,     // no-wait
+		queueName,
+		true,
+		false,
+		false,
+		false,
 		nil,
 	)
 	if err != nil {
@@ -57,13 +59,13 @@ type queueMiddleware struct {
 
 // Close implements [middleware.Middleware].
 func (q *queueMiddleware) Close() error {
-	if err := q.channel.Close(); err != nil {
+	chErr := q.channel.Close()
+	conErr := q.conn.Close()
+
+	if chErr != nil || conErr != nil {
 		return m.ErrMessageMiddlewareClose
 	}
 
-	if err := q.conn.Close(); err != nil {
-		return m.ErrMessageMiddlewareClose
-	}
 	return nil
 }
 
@@ -74,9 +76,9 @@ func (q *queueMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack fu
 	}
 
 	err := q.channel.Qos(
-		1,     // prefetch count
-		0,     // prefetch size
-		false, // global
+		1,
+		0,
+		false,
 	)
 
 	if err != nil {
@@ -89,13 +91,13 @@ func (q *queueMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack fu
 	consumerTag := "consumer-queue-" + q.queue
 
 	msgCh, err := q.channel.Consume(
-		q.queue,     // queue
-		consumerTag, // consumer
-		false,       // auto-ack
-		false,       // exclusive
-		false,       // no-local
-		false,       // no-wait
-		nil,         // args
+		q.queue,
+		consumerTag,
+		false,
+		false,
+		false,
+		false,
+		nil,
 	)
 
 	if err != nil {
@@ -157,14 +159,14 @@ func (q *queueMiddleware) StopConsuming() error {
 }
 
 func (q *queueMiddleware) Send(msg m.Message) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), publishTimeout)
 
 	defer cancel()
 
 	err := q.channel.PublishWithContext(ctx,
-		"",      // exchange
-		q.queue, // routing key
-		false,   // mandatory
+		"",
+		q.queue,
+		false,
 		false,
 		amqp.Publishing{
 			DeliveryMode: amqp.Persistent,
@@ -208,13 +210,13 @@ func CreateExchangeMiddleware(exchange string, keys []string, connectionSettings
 	}
 
 	err = ch.ExchangeDeclare(
-		exchange, // name
-		"direct", // type
-		false,    // durability
-		false,    // auto-deleted
-		false,    // internal
-		false,    // no-wait
-		nil,      // arguments
+		exchange,
+		"direct",
+		false,
+		false,
+		false,
+		false,
+		nil,
 	)
 	if err != nil {
 		_ = ch.Close()
@@ -227,29 +229,27 @@ func CreateExchangeMiddleware(exchange string, keys []string, connectionSettings
 
 // Close implements [middleware.Middleware].
 func (e *exchangeMiddleware) Close() error {
-	if err := e.channel.Close(); err != nil {
-		return m.ErrMessageMiddlewareClose
-	}
+	chErr := e.channel.Close()
+	conErr := e.conn.Close()
 
-	if err := e.conn.Close(); err != nil {
+	if chErr != nil || conErr != nil {
 		return m.ErrMessageMiddlewareClose
 	}
 
 	return nil
-
 }
 
 // Send implements [middleware.Middleware].
 func (e *exchangeMiddleware) Send(msg m.Message) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), publishTimeout)
 	defer cancel()
 
 	for _, key := range e.keys {
 		err := e.channel.PublishWithContext(ctx,
-			e.exchange, // exchange
-			key,        // routing key
-			false,      // mandatory
-			false,      // immediate
+			e.exchange,
+			key,
+			false,
+			false,
 			amqp.Publishing{
 				ContentType: "text/plain",
 				Body:        []byte(msg.Body),
@@ -275,9 +275,9 @@ func (e *exchangeMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack
 	}
 
 	err := e.channel.Qos(
-		10,    // prefetch count
-		0,     // prefetch size
-		false, // global
+		10,
+		0,
+		false,
 	)
 
 	if err != nil {
@@ -288,12 +288,12 @@ func (e *exchangeMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack
 	}
 
 	q, err := e.channel.QueueDeclare(
-		"",    // name
-		false, // durability
-		false, // delete when unused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
+		"",
+		false,
+		true,
+		true,
+		false,
+		nil,
 	)
 
 	queue := q.Name
@@ -306,13 +306,14 @@ func (e *exchangeMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack
 
 	for _, key := range e.keys {
 		err = e.channel.QueueBind(
-			queue,      // queue name
-			key,        // routing key
-			e.exchange, // exchange
+			queue,
+			key,
+			e.exchange,
 			false,
 			nil)
 
 		if err != nil {
+			_, _ = e.channel.QueueDelete(queue, false, false, false)
 			if errors.Is(err, amqp.ErrClosed) {
 				return m.ErrMessageMiddlewareDisconnected
 			}
@@ -323,16 +324,17 @@ func (e *exchangeMiddleware) StartConsuming(callbackFunc func(msg m.Message, ack
 	consumerTag := "consumer-exchange-" + queue
 
 	msgCh, err := e.channel.Consume(
-		queue,       // queue
-		consumerTag, // consumer
-		false,       // auto-ack
-		false,       // exclusive
-		false,       // no-local
-		false,       // no-wait
-		nil,         // args
+		queue,
+		consumerTag,
+		false,
+		false,
+		false,
+		false,
+		nil,
 	)
 
 	if err != nil {
+		_, _ = e.channel.QueueDelete(queue, false, false, false)
 		if errors.Is(err, amqp.ErrClosed) {
 			return m.ErrMessageMiddlewareDisconnected
 		}
